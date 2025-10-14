@@ -1,0 +1,13 @@
+{
+  "name": "ai-receptionist",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": { "start": "node server.mjs" },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "openai": "^4.59.0",
+    "twilio": "^5.3.4",
+    "ws": "^8.18.0"
+  }
+}
