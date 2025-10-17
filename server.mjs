@@ -33,6 +33,7 @@ app.post('/voice', (req, res) => {
   const connect = twiml.connect();
   connect.stream({
     url: STREAM_WSS,
+    track: 'both_tracks', // <-- bidirectional audio
     statusCallback: `${PUBLIC_BASE}/stream-status`,
     statusCallbackMethod: 'POST'
   });
@@ -61,7 +62,6 @@ app.post('/goodbye', (req, res) => {
 });
 
 /* ================== AUDIO HELPERS (μ-law) ================== */
-// μ-law decode -> 16-bit PCM
 function mulawDecode(mu) {
   const BIAS = 0x84;
   mu = ~mu & 0xff;
@@ -78,7 +78,6 @@ function decodeMuLawBuffer(b64) {
   for (let i = 0; i < buf.length; i++) out[i] = mulawDecode(buf[i]);
   return out; // PCM16 @ 8kHz
 }
-// PCM16 -> μ-law
 function linear2ulaw(sample) {
   const BIAS = 0x84, CLIP = 32635;
   let sign = (sample >> 8) & 0x80;
@@ -107,7 +106,7 @@ function down24kTo8k(int16) {
   for (let i = 0, j = 0; j < out.length; i += 3, j++) out[j] = int16[i];
   return out;
 }
-// 20ms μ-law silence frame (160 samples @ 8k)
+// 20ms μ-law silence frame (160 samples @ 8k) – Twilio expects ~20ms cadence
 function ulawSilenceB64() {
   const frame = Buffer.alloc(160, 0xFF);
   return frame.toString('base64');
@@ -206,7 +205,7 @@ LEAD name=<...>; phone=<...>; address=<...>; service=<...>; preferred=<...>; det
         streamSid = data.start?.streamSid || '';
         console.log('[Twilio] START callSid=', callSid, 'streamSid=', streamSid);
 
-        // kick off keep-alive silence until AI speaks or call stops
+        // keep-alive silence every 20ms until AI speaks or call stops
         if (!keepAlive) {
           const silence = ulawSilenceB64();
           keepAlive = setInterval(() => {
@@ -214,8 +213,8 @@ LEAD name=<...>; phone=<...>; address=<...>; service=<...>; preferred=<...>; det
             if (twilioWs.readyState === 1 && streamSid && !sentRealAudio) {
               twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload: silence } }));
             }
-          }, 200); // gentle 5fps
-          console.log('[KeepAlive] started');
+          }, 20); // 20ms cadence
+          console.log('[KeepAlive] started (20ms)');
         }
       }
 
@@ -295,7 +294,6 @@ LEAD name=<...>; phone=<...>; address=<...>; service=<...>; preferred=<...>; det
         }
 
         if (/^LEAD\b/i.test(line)) {
-          // Example parse; extend as needed
           const lead = {};
           const body = line.replace(/^LEAD\s*/i, '');
           body.split(';').forEach(pair => {
