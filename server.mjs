@@ -35,13 +35,12 @@ app.post('/voice', (req, res) => {
   const twiml = new VoiceResponse();
   twiml.say({ voice: 'Polly.Joanna-Neural' }, `Welcome to ${process.env.BUSINESS_NAME}. Connecting you now.`);
 
-  const connect = twiml.connect();
-  connect.stream({
-    url: `${publicBase().replace('https://','wss://').replace('http://','ws://')}/twilio-media`,
-    track: 'both_tracks',
-    statusCallback: `${publicBase()}/stream-status`,
-    statusCallbackMethod: 'POST'
-  });
+ const RENDER_URL = 'https://ai-receptionist-no7p.onrender.com'; // <-- put YOUR url
+connect.stream({
+  url: RENDER_URL.replace('https://','wss://') + '/twilio-media',
+  statusCallback: RENDER_URL + '/stream-status',
+  statusCallbackMethod: 'POST'
+});
 
   res.type('text/xml').send(twiml.toString());
 });
