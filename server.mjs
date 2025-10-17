@@ -5,7 +5,10 @@ import http from 'http';
 import twilio from 'twilio';
 import { WebSocketServer } from 'ws';
 import WebSocket from 'ws';
-import fetch from 'node-fetch'; // Node 20+ has global fetch; import for compatibility
+
+// ========= CONFIG (your Render URL) =========
+const RENDER_BASE = 'https://ai-receptionist-no7p.onrender.com'; // <-- your URL
+const WSS_URL = RENDER_BASE.replace('https://','wss://') + '/twilio-media';
 
 const app = express();
 app.use(express.urlencoded({ extended: true }));
@@ -17,38 +20,41 @@ const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_A
 const PORT = process.env.PORT || 3000;
 const server = http.createServer(app);
 
-// --- simple in-memory state ---
-const calls = new Map();           // callSid -> { lead:{}, priority:false }
-const streams = new Map();         // ws -> { callSid }
-const wsByCall = new Map();        // callSid -> ws
+// =============== Healthcheck ===============
+app.get('/', (_, res) => res.send('OK'));
 
-function publicBase() {
-  const url = process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`;
-  return url.replace(/\/+$/, '');
-}
+// ========= Simple in-memory per-call store =========
+const calls = new Map(); // callSid -> { lead:{}, priority:false, streamSid?:string }
+const wsForCall = new Map(); // callSid -> ws (Twilio media)
+const aiForCall = new Map(); // callSid -> ws (OpenAI)
 
-// ============ 1) TwiML entry: start Connect<Stream> ============
+// ====== TwiML entry: answer and start media stream ======
 app.post('/voice', (req, res) => {
   const { CallSid } = req.body || {};
   calls.set(CallSid, { lead: {}, priority: false });
 
   const twiml = new VoiceResponse();
-  twiml.say({ voice: 'Polly.Joanna-Neural' }, `Welcome to ${process.env.BUSINESS_NAME}. Connecting you now.`);
+  twiml.say({ voice: 'Polly.Joanna-Neural' }, `Welcome to ${process.env.BUSINESS_NAME || 'RegularUpkeep.com'}. Connecting you now.`);
 
   const connect = twiml.connect();
   connect.stream({
-    url: `${publicBase().replace('https://','wss://').replace('http://','ws://')}/twilio-media`,
-    track: 'both_tracks',
-    statusCallback: `${publicBase()}/stream-status`,
+    url: WSS_URL,
+    statusCallback: `${RENDER_BASE}/stream-status`,
     statusCallbackMethod: 'POST'
+    // NOTE: leaving default direction (inbound). We still send audio back.
   });
 
+  console.log('[TwiML] Sent <Connect><Stream> to', WSS_URL);
   res.type('text/xml').send(twiml.toString());
 });
 
-app.post('/stream-status', (req, res) => res.sendStatus(200));
+// Optional: logs from Twilio about the stream lifecycle
+app.post('/stream-status', (req, res) => {
+  console.log('[StreamStatus]', new Date().toISOString(), req.body);
+  res.sendStatus(200);
+});
 
-// ============ 2) Transfer endpoint (used when caller says "transfer") ============
+// ======= Transfer + Goodbye endpoints (used by AI triggers) =======
 app.post('/transfer', (req, res) => {
   const twiml = new VoiceResponse();
   twiml.say({ voice: 'Polly.Joanna-Neural' }, 'One moment while I connect you.');
@@ -56,17 +62,13 @@ app.post('/transfer', (req, res) => {
   res.type('text/xml').send(twiml.toString());
 });
 
-// ============ 3) Goodbye endpoint (optional end) ============
 app.post('/goodbye', (req, res) => {
   const twiml = new VoiceResponse();
   twiml.say({ voice: 'Polly.Joanna-Neural' }, 'Thanks for calling. We’ll follow up shortly. Goodbye.');
   res.type('text/xml').send(twiml.toString());
 });
 
-// ============ 4) WebSocket bridge: Twilio <-> OpenAI Realtime ============
-const wss = new WebSocketServer({ server, path: '/twilio-media' });
-
-// ---- tiny μ-law helpers (same as before) ----
+// ================== Audio helpers (μ-law <-> PCM) ==================
 function mulawDecode(mu) {
   const BIAS = 0x84;
   mu = ~mu & 0xFF;
@@ -81,7 +83,7 @@ function decodeMuLawBuffer(b64) {
   const buf = Buffer.from(b64, 'base64');
   const out = new Int16Array(buf.length);
   for (let i = 0; i < buf.length; i++) out[i] = mulawDecode(buf[i]);
-  return out;
+  return out; // PCM16 @ 8k
 }
 function linear2ulaw(sample) {
   const BIAS = 0x84;
@@ -100,7 +102,7 @@ function encodeMuLawBufferFromPCM(int16) {
   for (let i = 0; i < int16.length; i++) out[i] = linear2ulaw(int16[i]);
   return out.toString('base64');
 }
-// naive up/down sample
+// naive up/down sampling (8k <-> 24k) for demo
 function up8kTo24k(int16) {
   const out = new Int16Array(int16.length * 3);
   for (let i = 0; i < int16.length; i++) out[i*3] = out[i*3+1] = out[i*3+2] = int16[i];
@@ -112,9 +114,9 @@ function down24kTo8k(int16) {
   return out;
 }
 
-// ---- OpenAI Realtime connect ----
+// ============== OpenAI Realtime WS helper ==============
 function connectRealtime() {
-  const url = 'wss://api.openai.com/v1/realtime?model=gpt-realtime';
+  const url = 'wss://api.openai.com/v1/realtime?model=gpt-realtime'; // adjust model name if needed
   const headers = {
     Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
     'OpenAI-Beta': 'realtime=v1'
@@ -122,86 +124,34 @@ function connectRealtime() {
   return new WebSocket(url, { headers });
 }
 
-// ---- parse “LEAD:” lines the AI emits (backchannel) ----
-function parseLeadLine(line) {
-  // Example: LEAD name=Jane Doe; phone=252-555-0134; address=27893; service=HVAC; preferred=Tomorrow PM; details=AC not cooling; priority=true
-  const out = {};
-  const body = line.replace(/^LEAD\s*/i,'');
-  body.split(';').forEach(pair => {
-    const [k,v] = pair.split('=');
-    if (!k) return;
-    out[k.trim().toLowerCase()] = (v||'').trim();
-  });
-  return out;
-}
-
-// ---- summarize via SMS + Google Form drop ----
-async function finalizeLeadAndNotify(callSid) {
-  const state = calls.get(callSid);
-  if (!state) return;
-  const { lead = {}, priority = false } = state;
-
-  const text =
-`New ${priority ? 'PRIORITY ' : ''}lead:
-Name: ${lead.name||'?'}
-Phone: ${lead.phone||'?'}
-Address: ${lead.address||'?'}
-Service: ${lead.service||'?'}
-Preferred: ${lead.preferred||'?'}
-Details: ${lead.details||'?'}
-CallSid: ${callSid}`;
-
-  // SMS (optional)
-  if (process.env.ALERT_SMS_TO && process.env.ALERT_SMS_FROM) {
-    try {
-      await twilioClient.messages.create({
-        to: process.env.ALERT_SMS_TO,
-        from: process.env.ALERT_SMS_FROM,
-        body: text
-      });
-    } catch (e) { console.error('SMS failed', e.message); }
-  }
-
-  // Google Form drop (optional)
-  const action = process.env.GOOGLE_FORM_ACTION_URL;
-  const mapping = process.env.GOOGLE_FORM_FIELDS || '';
-  if (action && mapping) {
-    const mapObj = Object.fromEntries(mapping.split('&').map(x => x.split('=')));
-    const form = new URLSearchParams();
-    form.append(mapObj.name || 'entry.1', lead.name || '');
-    form.append(mapObj.phone || 'entry.2', lead.phone || '');
-    form.append(mapObj.address || 'entry.3', lead.address || '');
-    form.append(mapObj.service || 'entry.4', lead.service || '');
-    form.append(mapObj.preferred || 'entry.5', lead.preferred || '');
-    form.append(mapObj.details || 'entry.6', lead.details || '');
-    form.append(mapObj.priority || 'entry.7', (priority ? 'TRUE' : 'FALSE'));
-    try {
-      await fetch(action, { method: 'POST', body: form, headers: { 'Content-Type': 'application/x-www-form-urlencoded' }});
-    } catch(e) { console.error('Form post failed', e.message); }
-  }
-}
+// ================== WebSocket bridge ===================
+const wss = new WebSocketServer({ server, path: '/twilio-media' });
 
 wss.on('connection', (twilioWs) => {
-  // Connect AI
+  console.log('[WS] Twilio media stream CONNECTED', new Date().toISOString());
+
+  // Connect to OpenAI Realtime
   const ai = connectRealtime();
 
-  // wire up
+  // State captured from Twilio "start" event
+  let callSid = '';
+  let streamSid = '';
+
+  // When OpenAI is ready, configure session (voice + rules)
   ai.on('open', () => {
-    // instructions tell the model to emit LEAD lines & TRANSFER / DONE signals
+    console.log('[AI] Realtime WS OPEN');
     const payload = {
       type: 'session.update',
       session: {
         instructions:
-`You are a warm, efficient receptionist for ${process.env.BUSINESS_NAME}.
-Speak briefly, allow interruptions. Collect:
+`You are a warm, efficient receptionist for ${process.env.BUSINESS_NAME || 'RegularUpkeep.com'}.
+Speak briefly; allow interruptions. Collect:
 - name, phone, address or ZIP, service (Plumbing/HVAC/Electrical/Handyman), preferred date + morning/afternoon, short details.
-If caller says anything like "transfer", "operator", "person", stop speaking and output a single line: TRANSFER.
-If the issue is urgent (leak, no heat/AC, smoke/sparks, burning smell), mark priority true.
-
-Backchannel for the developer (do NOT read aloud):
-Whenever you confirm new info, output one line starting with:
-LEAD name=<...>; phone=<...>; address=<...>; service=<...>; preferred=<...>; details=<...>; priority=<true|false>
-When you have enough info, output a single line: DONE`,
+If caller asks for a person ("transfer", "operator", "agent"), stop speaking and output a single line: TRANSFER
+When you have enough info, output a single line: DONE
+Backchannel for developer (not spoken):
+Emit lines like:
+LEAD name=<...>; phone=<...>; address=<...>; service=<...>; preferred=<...>; details=<...>; priority=<true|false>`,
         voice: 'alloy',
         input_audio_format: 'pcm16',
         output_audio_format: 'pcm16',
@@ -211,93 +161,104 @@ When you have enough info, output a single line: DONE`,
     ai.send(JSON.stringify(payload));
   });
 
-  // Receive audio from Twilio -> send to AI
+  ai.on('error', (e) => console.error('[AI] error', e.message));
+  ai.on('close', () => console.log('[AI] Realtime WS CLOSED'));
+
+  // From Twilio -> to OpenAI
   twilioWs.on('message', (raw) => {
     try {
       const data = JSON.parse(raw.toString());
+
       if (data.event === 'start') {
-        const callSid = data.start?.callSid;
-        if (callSid) {
-          streams.set(twilioWs, { callSid });
-          wsByCall.set(callSid, twilioWs);
-          if (!calls.has(callSid)) calls.set(callSid, { lead: {}, priority: false });
-          console.log('Stream started for', callSid);
-        }
+        callSid = data.start?.callSid || '';
+        streamSid = data.start?.streamSid || '';
+        wsForCall.set(callSid, twilioWs);
+        aiForCall.set(callSid, ai);
+        if (!calls.has(callSid)) calls.set(callSid, { lead: {}, priority: false });
+        console.log('[Twilio] START callSid=', callSid, 'streamSid=', streamSid);
       }
+
       if (data.event === 'media') {
+        // Caller audio (μ-law 8k) -> PCM 24k -> send to AI
         const pcm8 = decodeMuLawBuffer(data.media.payload);
         const pcm24 = up8kTo24k(pcm8);
         ai.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: Buffer.from(pcm24.buffer).toString('base64') }));
         ai.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
       }
+
+      if (data.event === 'mark') {
+        // ignore keepalives
+      }
+
       if (data.event === 'stop') {
-        const callSid = streams.get(twilioWs)?.callSid;
-        if (callSid) finalizeLeadAndNotify(callSid);
+        console.log('[Twilio] STOP for', callSid);
         try { ai.close(); } catch {}
-        streams.delete(twilioWs);
-        console.log('Stream stopped');
+        wsForCall.delete(callSid);
+        aiForCall.delete(callSid);
       }
     } catch (e) {
-      console.error('Twilio WS parse error', e.message);
+      console.error('[Twilio] WS parse error', e.message);
     }
   });
 
   twilioWs.on('close', () => {
-    const callSid = streams.get(twilioWs)?.callSid;
-    if (callSid) finalizeLeadAndNotify(callSid);
+    console.log('[WS] Twilio media stream CLOSED');
     try { ai.close(); } catch {}
-    streams.delete(twilioWs);
   });
 
-  // Receive from AI -> play to caller & watch for control lines
+  // From OpenAI -> back to Twilio (AUDIO + control text)
   ai.on('message', (buf) => {
     try {
       const msg = JSON.parse(buf.toString());
 
-      // audio chunks back to caller
-      if (msg.type === 'output_audio.delta' && msg.audio) {
+      // AUDIO back to caller
+      if (msg.type === 'output_audio.delta' && msg.audio && streamSid) {
         const pcm24 = new Int16Array(Buffer.from(msg.audio, 'base64').buffer);
         const pcm8 = down24kTo8k(pcm24);
         const b64ulaw = encodeMuLawBufferFromPCM(pcm8);
-        twilioWs.send(JSON.stringify({ event: 'media', media: { payload: b64ulaw } }));
+
+        // IMPORTANT: include streamSid when sending audio to Twilio
+        const frame = { event: 'media', streamSid, media: { payload: b64ulaw } };
+        twilioWs.send(JSON.stringify(frame));
       }
 
-      // read model text to catch LEAD / DONE / TRANSFER lines
+      // TEXT: watch for LEAD / DONE / TRANSFER
       if (msg.type === 'output_text.delta' && msg.delta) {
         const line = msg.delta.trim();
+        if (!line) return;
 
-        // Which call is this for?
-        const callSid = streams.get(twilioWs)?.callSid;
-        if (!callSid) return;
-
-        // BACKCHANNEL parsing
-        if (/^LEAD\b/i.test(line)) {
-          const found = parseLeadLine(line);
-          const st = calls.get(callSid) || { lead: {}, priority: false };
-          st.lead = { ...st.lead, ...found };
-          if (String(found.priority || '').toLowerCase() === 'true') st.priority = true;
-          calls.set(callSid, st);
-        } else if (/^TRANSFER$/i.test(line)) {
-          // Redirect live call to /transfer
-          twilioClient.calls(callSid).update({ url: `${publicBase()}/transfer`, method: 'POST' }).catch(e => console.error('Transfer failed', e.message));
-        } else if (/^DONE$/i.test(line)) {
-          // End gracefully
-          twilioClient.calls(callSid).update({ url: `${publicBase()}/goodbye`, method: 'POST' }).catch(e => console.error('Goodbye failed', e.message));
+        // parse control words
+        if (/^TRANSFER$/i.test(line) && callSid) {
+          console.log('[CTRL] TRANSFER');
+          twilioClient.calls(callSid).update({ url: `${RENDER_BASE}/transfer`, method: 'POST' })
+            .catch(e => console.error('[CTRL] transfer failed', e.message));
+          return;
+        }
+        if (/^DONE$/i.test(line) && callSid) {
+          console.log('[CTRL] DONE -> goodbye');
+          twilioClient.calls(callSid).update({ url: `${RENDER_BASE}/goodbye`, method: 'POST' })
+            .catch(e => console.error('[CTRL] goodbye failed', e.message));
+          return;
         }
 
-        // Emergency hint if keywords appear in AI text (belt-and-suspenders)
-        if (/(leak|flood|no heat|no ac|smoke|sparks|burning)/i.test(line)) {
-          const st = calls.get(callSid) || { lead: {}, priority: false };
-          st.priority = true; calls.set(callSid, st);
+        // very light LEAD capture (optional)
+        if (/^LEAD\b/i.test(line) && callSid) {
+          const entry = (calls.get(callSid) || { lead: {}, priority: false });
+          const body = line.replace(/^LEAD\s*/i,'');
+          body.split(';').forEach(pair => {
+            const [k,v] = pair.split('=');
+            if (!k) return;
+            entry.lead[k.trim().toLowerCase()] = (v||'').trim();
+          });
+          if (String(entry.lead.priority||'').toLowerCase() === 'true') entry.priority = true;
+          calls.set(callSid, entry);
+          console.log('[LEAD]', entry.lead);
         }
       }
     } catch (e) {
-      console.error('AI msg error', e.message);
+      console.error('[AI] msg error', e.message);
     }
   });
-
-  ai.on('close', () => console.log('Realtime WS closed'));
-  ai.on('error', (e) => console.error('Realtime WS error', e.message));
 });
 
 server.listen(PORT, () => console.log(`Server listening on :${PORT}`));
