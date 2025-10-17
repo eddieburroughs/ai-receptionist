@@ -33,9 +33,9 @@ app.post('/voice', (req, res) => {
   const connect = twiml.connect();
   connect.stream({
     url: STREAM_WSS,
-    track: 'both_tracks', // <-- bidirectional audio
     statusCallback: `${PUBLIC_BASE}/stream-status`,
     statusCallbackMethod: 'POST'
+    // NOTE: no 'track' attribute here; <Connect><Stream> is already bidirectional.
   });
 
   console.log('[TwiML] <Connect><Stream> →', STREAM_WSS);
@@ -106,7 +106,7 @@ function down24kTo8k(int16) {
   for (let i = 0, j = 0; j < out.length; i += 3, j++) out[j] = int16[i];
   return out;
 }
-// 20ms μ-law silence frame (160 samples @ 8k) – Twilio expects ~20ms cadence
+// 20ms μ-law silence frame (160 samples @ 8k) – keep-alive cadence
 function ulawSilenceB64() {
   const frame = Buffer.alloc(160, 0xFF);
   return frame.toString('base64');
