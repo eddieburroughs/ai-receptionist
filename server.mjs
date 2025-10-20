@@ -26,17 +26,19 @@ const server = http.createServer(app);
 app.get('/', (_, res) => res.send('OK'));
 
 /* ================== AUDIO HELPERS (μ-law) ================== */
+// μ-law <-> PCM16
 function mulawDecode(mu){const BIAS=0x84;mu=~mu&0xff;const sign=mu&0x80;let exponent=(mu&0x70)>>4;let mantissa=mu&0x0f;let sample=((mantissa<<4)+8)<<(exponent+3);sample-=BIAS;return sign?-sample:sample;}
 function decodeMuLawBuffer(b64){const buf=Buffer.from(b64,'base64');const out=new Int16Array(buf.length);for(let i=0;i<buf.length;i++)out[i]=mulawDecode(buf[i]);return out;}
 function linear2ulaw(sample){const BIAS=0x84,CLIP=32635;let sign=(sample>>8)&0x80;if(sign!==0)sample=-sample;if(sample>CLIP)sample=CLIP;sample+=BIAS;let exponent=7;for(let m=0x4000;(sample&m)===0&&exponent>0;exponent--,m>>=1){}const mantissa=(sample>>((exponent===0)?4:(exponent+3)))&0x0f;return(~(sign|(exponent<<4)|mantissa))&0xff;}
 function encodeMuLawBufferFromPCM(int16){const out=Buffer.alloc(int16.length);for(let i=0;i<int16.length;i++)out[i]=linear2ulaw(int16[i]);return out.toString('base64');}
-function up8kTo24k(int16){const out=new Int16Array(int16.length*3);for(let i=0;i<int16.length;i++){out[i*3]=out[i*3+1]=out[i*3+2]=int16[i];}return out;}
-function down24kTo8k(int16){const out=new Int16Array(Math.floor(int16.length/3));for(let i=0,j=0;j<out.length;i+=3,j++)out[j]=int16[i];return out;}
 function ulawSilenceB64(){return Buffer.alloc(160,0xFF).toString('base64');} // 20ms @ 8kHz
 
+// ★ Resampling: Twilio 8 kHz  <->  OpenAI 16 kHz (duplicate / drop every other sample)
+function up8kTo16k(int16){const out=new Int16Array(int16.length*2);for(let i=0;i<int16.length;i++){out[i*2]=int16[i];out[i*2+1]=int16[i];}return out;}
+function down16kTo8k(int16){const out=new Int16Array(Math.floor(int16.length/2));for(let i=0,j=0;j<out.length;i+=2,j++)out[j]=int16[i];return out;}
+
 /* ================= OPENAI REALTIME (GLOBAL) ================= */
-// One warm connection so Shirley speaks immediately.
-// Strong logging for close/upgrade to diagnose flapping.
+// Keep one warm connection (with explicit "realtime" subprotocol) and PRINT FULL ERRORS.
 let globalAI = null;
 let aiReady  = false;
 let isConnecting = false;
@@ -47,7 +49,7 @@ function connectRealtime() {
     Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
     'OpenAI-Beta': 'realtime=v1'
   };
-  // IMPORTANT: pass the "realtime" subprotocol explicitly
+  // IMPORTANT: subprotocol "realtime"
   return new WebSocket(url, 'realtime', { headers });
 }
 
@@ -64,7 +66,6 @@ function ensureGlobalAI() {
     isConnecting = false;
     console.log('[AI] GLOBAL OPEN');
 
-    // Minimal, server-accepted session settings
     const payload = {
       type: 'session.update',
       session: {
@@ -81,8 +82,9 @@ When you have all details, politely close and output DONE.
 For urgent issues (leak, smoke, no AC/heat), mark priority=true in a LEAD line.
 Stay concise and human. Barge-in friendly. Use natural fillers sparingly.`,
         voice: 'alloy',
-        input_audio_format: 'pcm16',
-        output_audio_format: 'pcm16',
+        // ★ Keep formats plain + explicit 16kHz
+        input_audio_format: { type: 'pcm16', sample_rate: 16000 },
+        output_audio_format: { type: 'pcm16', sample_rate: 16000 },
         turn_detection: { type: 'server_vad' }
       }
     };
@@ -90,13 +92,18 @@ Stay concise and human. Barge-in friendly. Use natural fillers sparingly.`,
   });
 
   ws.on('message', (buf) => {
-    // Global debug tap so we can see types flowing
     try {
       const msg = JSON.parse(buf.toString());
       if (msg?.type && msg.type !== 'output_audio.delta') {
-        console.log('[AI][DBG]', msg.type);
+        if (msg.type === 'error') {
+          console.error('[AI][ERR]', msg.error?.message || msg.message || '(no message)', JSON.stringify(msg, null, 2));
+        } else {
+          console.log('[AI][DBG]', msg.type);
+        }
       }
-    } catch {}
+    } catch (e) {
+      console.error('[AI][PARSE]', e.message);
+    }
   });
 
   ws.on('unexpected-response', async (req, res) => {
@@ -105,7 +112,7 @@ Stay concise and human. Barge-in friendly. Use natural fillers sparingly.`,
       const chunks = [];
       for await (const c of res) chunks.push(c);
       const body = Buffer.concat(chunks).toString();
-      console.error('[AI] unexpected-response body=', body.slice(0, 1000));
+      console.error('[AI] unexpected-response body=', body.slice(0, 2000));
     } catch (e) {
       console.error('[AI] unexpected-response read error', e.message);
     }
@@ -123,29 +130,23 @@ Stay concise and human. Barge-in friendly. Use natural fillers sparingly.`,
       catch { return '<unreadable>'; }
     })();
     console.error(`[AI] GLOBAL CLOSED code=${code} reason=${reason}`);
-    // backoff a bit (2s) to avoid tight flapping loop
-    setTimeout(() => ensureGlobalAI(), 2000);
+    setTimeout(() => ensureGlobalAI(), 2000); // small backoff
   });
 }
-
-// warm it at boot and keep it warm
 ensureGlobalAI();
 setInterval(() => ensureGlobalAI(), 60_000);
 
 /* =================== VOICE ENTRY / TWIML =================== */
 app.post('/voice', (req, res) => {
-  ensureGlobalAI(); // make sure it's warming/open
-
+  ensureGlobalAI();
   const twiml = new VoiceResponse();
-  // No Twilio TTS — go straight into streaming so Shirley is first voice.
+  // No <Say> — go straight to AI streaming
   const connect = twiml.connect();
   connect.stream({
     url: STREAM_WSS,
     statusCallback: `${PUBLIC_BASE}/stream-status`,
     statusCallbackMethod: 'POST'
-    // NOTE: no 'track' attribute; <Connect><Stream> is bidirectional.
   });
-
   console.log('[TwiML] <Connect><Stream> →', STREAM_WSS);
   res.type('text/xml').send(twiml.toString());
 });
@@ -181,20 +182,26 @@ wss.on('connection', (twilioWs) => {
   let mediaCount = 0;
   let greetingWatchdog = null;
 
+  // Per-call AI->Twilio relay
   const onAIMessage = (buf) => {
     if (stopped) return;
     try {
       const msg = JSON.parse(buf.toString());
 
       if (msg.type && msg.type !== 'output_audio.delta') {
-        console.log('[AI][CALLDBG]', msg.type);
+        if (msg.type === 'error') {
+          console.error('[AI][CALLERR]', msg.error?.message || msg.message || '(no message)', JSON.stringify(msg, null, 2));
+        } else {
+          console.log('[AI][CALLDBG]', msg.type);
+        }
       }
 
+      // AUDIO back to caller
       if (msg.type === 'output_audio.delta' && msg.audio) {
         if (streamSid && twilioWs.readyState === 1) {
-          const pcm24 = new Int16Array(Buffer.from(msg.audio, 'base64').buffer);
-          const pcm8  = down24kTo8k(pcm24);
-          const b64ulaw = encodeMuLawBufferFromPCM(pcm8);
+          const pcm16k = new Int16Array(Buffer.from(msg.audio, 'base64').buffer);
+          const pcm8k  = down16kTo8k(pcm16k);
+          const b64ulaw = encodeMuLawBufferFromPCM(pcm8k);
 
           if (!sentRealAudio && keepAlive) {
             clearInterval(keepAlive);
@@ -207,22 +214,21 @@ wss.on('connection', (twilioWs) => {
         }
       }
 
+      // TEXT control / backchannel
       if (msg.type === 'output_text.delta' && msg.delta) {
         const line = msg.delta.trim();
         if (!line) return;
 
         if (/^TRANSFER$/i.test(line) && callSid) {
           console.log('[CTRL] TRANSFER');
-          twilioClient.calls(callSid)
-            .update({ url: `${PUBLIC_BASE}/transfer`, method: 'POST' })
+          twilioClient.calls(callSid).update({ url: `${PUBLIC_BASE}/transfer`, method: 'POST' })
             .catch(e => console.error('[CTRL] transfer failed', e.message));
           return;
         }
 
         if (/^DONE$/i.test(line) && callSid) {
           console.log('[CTRL] DONE → goodbye');
-          twilioClient.calls(callSid)
-            .update({ url: `${PUBLIC_BASE}/goodbye`, method: 'POST' })
+          twilioClient.calls(callSid).update({ url: `${PUBLIC_BASE}/goodbye`, method: 'POST' })
             .catch(e => console.error('[CTRL] goodbye failed', e.message));
           return;
         }
@@ -235,12 +241,13 @@ wss.on('connection', (twilioWs) => {
         }
       }
     } catch (e) {
-      console.error('[AI->Twilio error]', e.message);
+      console.error('[AI->Twilio parse/send error]', e.message);
     }
   };
 
   if (globalAI) globalAI.on('message', onAIMessage);
 
+  // Twilio -> AI
   twilioWs.on('message', (raw) => {
     try {
       const data = JSON.parse(raw.toString());
@@ -251,7 +258,7 @@ wss.on('connection', (twilioWs) => {
         streamSid = data.start?.streamSid || '';
         console.log('[Twilio] START', callSid, streamSid);
 
-        // Keep Twilio alive until first AI audio
+        // Keep Twilio alive with 20ms μ-law silence until first AI audio
         const silence = ulawSilenceB64();
         keepAlive = setInterval(() => {
           if (!sentRealAudio && !stopped && twilioWs.readyState === 1 && streamSid) {
@@ -290,9 +297,11 @@ wss.on('connection', (twilioWs) => {
 
       if (data.event === 'media') {
         if (++mediaCount % 50 === 0) console.log('[DEBUG] got media chunk x', mediaCount);
-        const pcm8  = decodeMuLawBuffer(data.media.payload);
-        const pcm24 = up8kTo24k(pcm8);
-        const b64   = Buffer.from(pcm24.buffer).toString('base64');
+
+        // Twilio 8k -> OpenAI 16k
+        const pcm8k  = decodeMuLawBuffer(data.media.payload);
+        const pcm16k = up8kTo16k(pcm8k);
+        const b64    = Buffer.from(pcm16k.buffer).toString('base64');
 
         if (globalAI && aiReady && globalAI.readyState === 1 && !stopped) {
           globalAI.send(JSON.stringify({ type:'input_audio_buffer.append', audio:b64 }));
