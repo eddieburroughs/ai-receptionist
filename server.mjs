@@ -35,25 +35,36 @@ function down24kTo8k(int16){const out=new Int16Array(Math.floor(int16.length/3))
 function ulawSilenceB64(){return Buffer.alloc(160,0xFF).toString('base64');} // 20ms @ 8kHz
 
 /* ================= OPENAI REALTIME (GLOBAL) ================= */
-/** Keep a single warm Realtime connection so Shirley speaks immediately. */
+// One warm connection so Shirley speaks immediately.
+// Strong logging for close/upgrade to diagnose flapping.
 let globalAI = null;
 let aiReady  = false;
+let isConnecting = false;
 
 function connectRealtime() {
   const url = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(REALTIME_MODEL)}`;
-  const headers = { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'OpenAI-Beta': 'realtime=v1' };
-  return new WebSocket(url, { headers });
+  const headers = {
+    Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+    'OpenAI-Beta': 'realtime=v1'
+  };
+  // IMPORTANT: pass the "realtime" subprotocol explicitly
+  return new WebSocket(url, 'realtime', { headers });
 }
 
 function ensureGlobalAI() {
-  if (globalAI && globalAI.readyState === 1) return;
-  aiReady = false;
-  globalAI = connectRealtime();
+  if (aiReady || isConnecting) return;
+  if (globalAI && globalAI.readyState === 1) { aiReady = true; return; }
+  isConnecting = true;
 
-  globalAI.on('open', () => {
+  const ws = connectRealtime();
+  globalAI = ws;
+
+  ws.on('open', () => {
     aiReady = true;
+    isConnecting = false;
     console.log('[AI] GLOBAL OPEN');
 
+    // Minimal, server-accepted session settings
     const payload = {
       type: 'session.update',
       session: {
@@ -61,9 +72,7 @@ function ensureGlobalAI() {
 `You are Shirley, the friendly and professional voice receptionist for ${BUSINESS}.
 Speak naturally with warmth, short sentences, slight pauses, and a smile in your tone.
 You answer incoming phone calls for home maintenance services and collect:
-- name
-- phone number
-- address or ZIP
+- name, phone number, address or ZIP
 - service type (Plumbing, HVAC, Electrical, Handyman)
 - preferred time (morning/afternoon, day)
 - brief details of the issue
@@ -77,27 +86,58 @@ Stay concise and human. Barge-in friendly. Use natural fillers sparingly.`,
         turn_detection: { type: 'server_vad' }
       }
     };
-    try { globalAI.send(JSON.stringify(payload)); } catch {}
+    try { ws.send(JSON.stringify(payload)); } catch (e) { console.error('[AI] session.update send error', e.message); }
   });
 
-  globalAI.on('ping', d => { try { globalAI.pong(d); } catch {} });
-  globalAI.on('error', e => console.error('[AI] GLOBAL error', e.message));
-  globalAI.on('close', () => {
+  ws.on('message', (buf) => {
+    // Global debug tap so we can see types flowing
+    try {
+      const msg = JSON.parse(buf.toString());
+      if (msg?.type && msg.type !== 'output_audio.delta') {
+        console.log('[AI][DBG]', msg.type);
+      }
+    } catch {}
+  });
+
+  ws.on('unexpected-response', async (req, res) => {
+    console.error('[AI] unexpected-response status=', res.statusCode);
+    try {
+      const chunks = [];
+      for await (const c of res) chunks.push(c);
+      const body = Buffer.concat(chunks).toString();
+      console.error('[AI] unexpected-response body=', body.slice(0, 1000));
+    } catch (e) {
+      console.error('[AI] unexpected-response read error', e.message);
+    }
+  });
+
+  ws.on('error', (e) => {
+    console.error('[AI] GLOBAL error', e?.message || e);
+  });
+
+  ws.on('close', (code, reasonBuf) => {
     aiReady = false;
-    console.log('[AI] GLOBAL CLOSED — reconnecting in 1s');
-    setTimeout(ensureGlobalAI, 1000);
+    isConnecting = false;
+    const reason = (() => {
+      try { return Buffer.from(reasonBuf || '').toString() || '<no reason>'; }
+      catch { return '<unreadable>'; }
+    })();
+    console.error(`[AI] GLOBAL CLOSED code=${code} reason=${reason}`);
+    // backoff a bit (2s) to avoid tight flapping loop
+    setTimeout(() => ensureGlobalAI(), 2000);
   });
 }
+
+// warm it at boot and keep it warm
 ensureGlobalAI();
-setInterval(ensureGlobalAI, 60_000); // keep it warm
+setInterval(() => ensureGlobalAI(), 60_000);
 
 /* =================== VOICE ENTRY / TWIML =================== */
 app.post('/voice', (req, res) => {
-  // Make sure the AI is warming before Twilio streams
-  ensureGlobalAI();
+  ensureGlobalAI(); // make sure it's warming/open
 
   const twiml = new VoiceResponse();
-  // No <Say> — go straight into <Connect><Stream> so Shirley is the first voice.
+  // No Twilio TTS — go straight into streaming so Shirley is first voice.
   const connect = twiml.connect();
   connect.stream({
     url: STREAM_WSS,
@@ -122,7 +162,6 @@ app.post('/transfer', (req, res) => {
   twiml.dial(process.env.TRANSFER_NUMBER);
   res.type('text/xml').send(twiml.toString());
 });
-
 app.post('/goodbye', (req, res) => {
   const twiml = new VoiceResponse();
   twiml.say({ voice: 'Polly.Joanna-Neural' }, 'Thanks for calling. Goodbye.');
@@ -140,21 +179,23 @@ wss.on('connection', (twilioWs) => {
   let keepAlive = null;
   let sentRealAudio = false;
   let mediaCount = 0;
+  let greetingWatchdog = null;
 
-  // Attach a dedicated AI->Twilio relay for THIS connection
   const onAIMessage = (buf) => {
     if (stopped) return;
     try {
       const msg = JSON.parse(buf.toString());
 
-      // AUDIO back to caller
+      if (msg.type && msg.type !== 'output_audio.delta') {
+        console.log('[AI][CALLDBG]', msg.type);
+      }
+
       if (msg.type === 'output_audio.delta' && msg.audio) {
         if (streamSid && twilioWs.readyState === 1) {
           const pcm24 = new Int16Array(Buffer.from(msg.audio, 'base64').buffer);
           const pcm8  = down24kTo8k(pcm24);
           const b64ulaw = encodeMuLawBufferFromPCM(pcm8);
 
-          // Stop the silence pump on first real audio
           if (!sentRealAudio && keepAlive) {
             clearInterval(keepAlive);
             keepAlive = null;
@@ -166,7 +207,6 @@ wss.on('connection', (twilioWs) => {
         }
       }
 
-      // TEXT control and backchannel
       if (msg.type === 'output_text.delta' && msg.delta) {
         const line = msg.delta.trim();
         if (!line) return;
@@ -190,10 +230,7 @@ wss.on('connection', (twilioWs) => {
         if (/^LEAD\b/i.test(line)) {
           const lead = {};
           const body = line.replace(/^LEAD\s*/i,'');
-          body.split(';').forEach(p => {
-            const [k,v] = p.split('=');
-            if (k) lead[k.trim().toLowerCase()] = (v||'').trim();
-          });
+          body.split(';').forEach(p => { const [k,v]=p.split('='); if (k) lead[k.trim().toLowerCase()] = (v||'').trim(); });
           console.log('[LEAD]', lead);
         }
       }
@@ -204,7 +241,6 @@ wss.on('connection', (twilioWs) => {
 
   if (globalAI) globalAI.on('message', onAIMessage);
 
-  // Twilio -> AI
   twilioWs.on('message', (raw) => {
     try {
       const data = JSON.parse(raw.toString());
@@ -215,7 +251,7 @@ wss.on('connection', (twilioWs) => {
         streamSid = data.start?.streamSid || '';
         console.log('[Twilio] START', callSid, streamSid);
 
-        // Keep-alive: 20ms μ-law silence until AI speaks
+        // Keep Twilio alive until first AI audio
         const silence = ulawSilenceB64();
         keepAlive = setInterval(() => {
           if (!sentRealAudio && !stopped && twilioWs.readyState === 1 && streamSid) {
@@ -224,7 +260,7 @@ wss.on('connection', (twilioWs) => {
         }, 20);
         console.log('[KeepAlive] started (20ms)');
 
-        // Trigger Shirley's first line immediately
+        // Trigger Shirley's first line immediately + watchdog
         if (globalAI && aiReady && globalAI.readyState === 1) {
           console.log('[AI] greeting sent');
           globalAI.send(JSON.stringify({
@@ -234,6 +270,19 @@ wss.on('connection', (twilioWs) => {
               instructions: `Welcome to ${BUSINESS}, this is Shirley. How can I help you today?`
             }
           }));
+
+          greetingWatchdog = setTimeout(() => {
+            if (!sentRealAudio && !stopped && globalAI.readyState === 1) {
+              console.log('[AI] greeting retry (no audio yet)');
+              globalAI.send(JSON.stringify({
+                type: 'response.create',
+                response: {
+                  modalities: ['audio'],
+                  instructions: `Hi there! This is Shirley with ${BUSINESS}. What can I do for you today?`
+                }
+              }));
+            }
+          }, 2000);
         } else {
           console.log('[AI] greeting deferred (AI not ready)');
         }
@@ -256,6 +305,7 @@ wss.on('connection', (twilioWs) => {
         stopped = true;
         console.log('[Twilio] STOP', callSid);
         if (keepAlive) { clearInterval(keepAlive); keepAlive = null; console.log('[KeepAlive] stopped'); }
+        if (greetingWatchdog) { clearTimeout(greetingWatchdog); greetingWatchdog = null; }
       }
     } catch (e) {
       console.error('[Twilio WS error]', e.message);
@@ -265,7 +315,8 @@ wss.on('connection', (twilioWs) => {
   twilioWs.on('close', () => {
     console.log('[WS] Twilio media CLOSED');
     if (keepAlive) { clearInterval(keepAlive); keepAlive = null; }
-    if (globalAI) globalAI.off?.('message', onAIMessage); // remove relay listener
+    if (greetingWatchdog) { clearTimeout(greetingWatchdog); greetingWatchdog = null; }
+    if (globalAI) globalAI.off?.('message', onAIMessage);
   });
 });
 
